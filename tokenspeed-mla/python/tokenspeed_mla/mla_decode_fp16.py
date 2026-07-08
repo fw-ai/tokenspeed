@@ -2755,8 +2755,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 (tTR_rAcc_red, tTR_rMax),
             )
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
+            # Bind cta_m_rows unconditionally so the SM103 bf16/fp16 decode compiles.
+            cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
             if apply_mask:
-                cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                     qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(self.is_causal):
