@@ -626,10 +626,16 @@ def tokenspeed_mla_decode(
         compute_capability=compute_capability,
     )
 
-    # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros
-    # (not empty) so any kernel-unwritten positions are a known value, not garbage.
+    # DCP: initialize LSE to the empty-softmax identity. Zero-length sequences
+    # have no scheduled work tile, so the kernel intentionally leaves those
+    # positions untouched.
     if return_lse:
-        lse_real = torch.zeros((B, q_len, H), dtype=torch.float32, device=query.device)
+        lse_real = torch.full(
+            (B, q_len, H),
+            float("-inf"),
+            dtype=torch.float32,
+            device=query.device,
+        )
     else:
         lse_real = None
 

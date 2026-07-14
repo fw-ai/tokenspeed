@@ -1741,7 +1741,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 lse_max + cute.math.log2(sum_lse, fastmath=True)
                 if not sum_lse == self.lse_dtype(0.0)
                 or sum_lse != sum_lse  # noqa: SIM201
-                else self.lse_dtype.inf
+                else -self.lse_dtype.inf
             )
             if tidx == 0:
                 if cutlass.const_expr(not self.skip_lse):

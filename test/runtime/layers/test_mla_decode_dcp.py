@@ -47,7 +47,7 @@ PAGE = 64
 
 
 def _workspace():
-    from tokenspeed_mla import get_num_sm
+    from tokenspeed_mla.utils import get_num_sm
 
     n = get_num_sm(torch.device("cuda")) * H * 8 * (KV_LORA + 1) * 4
     return torch.empty(n, dtype=torch.int8, device="cuda")
@@ -76,7 +76,7 @@ def _decode(
     cp_rank=0,
     lse=False,
 ):
-    from tokenspeed_mla import tokenspeed_mla_decode
+    from tokenspeed_mla.mla_decode import tokenspeed_mla_decode
 
     return tokenspeed_mla_decode(
         query=query,
@@ -203,6 +203,67 @@ def test_return_lse_toggles_output_shape():
     assert o.shape == (1, Q, H, KV_LORA)
     assert lse.shape == (1, Q, H)
     torch.testing.assert_close(o, out, rtol=0, atol=0)  # LSE path must not alter output
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    ("batch_size", "seq_len"),
+    [(2, 1024), (128, 64)],
+    ids=["split-kv", "single-split"],
+)
+def test_zero_length_sequence_returns_negative_infinite_lse(dtype, batch_size, seq_len):
+    """An empty KV row contributes zero softmax mass in every launch mode."""
+    from tokenspeed_mla.mla_decode import tokenspeed_mla_decode
+
+    torch.manual_seed(5)
+    q_len, num_heads = 1, 96
+    pages_per_seq = (seq_len + PAGE - 1) // PAGE
+    num_pages = batch_size * pages_per_seq
+
+    query = torch.randn(
+        batch_size,
+        q_len,
+        num_heads,
+        D,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).to(dtype)
+    cache = torch.randn(
+        num_pages,
+        PAGE,
+        D,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).to(dtype)
+    block_tables = torch.arange(
+        num_pages,
+        device="cuda",
+        dtype=torch.int32,
+    ).reshape(batch_size, pages_per_seq)
+    seq_lens = torch.full(
+        (batch_size,),
+        seq_len,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    seq_lens[0] = 0
+
+    _, lse = tokenspeed_mla_decode(
+        query=query,
+        kv_cache=cache,
+        workspace_buffer=_workspace(),
+        kv_lora_rank=KV_LORA,
+        qk_rope_head_dim=QK_ROPE,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len,
+        softmax_scale=1.0 / (D**0.5),
+        output_scale=1.0,
+        return_lse=True,
+    )
+
+    assert torch.isneginf(lse[0]).all()
+    assert torch.isfinite(lse[1:]).all()
 
 
 def test_dcp_rejects_non_fp8_dtype():
