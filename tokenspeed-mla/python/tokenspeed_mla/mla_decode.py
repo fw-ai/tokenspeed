@@ -78,6 +78,22 @@ def _get_split_kv_and_workspace_size(
         workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
             H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
         )
+    elif (
+        is_fp8
+        and mma_qk_tiler_mn[0] == 128
+        and H == 96
+        and q_len == 1
+        and kv_lora_rank == 512
+    ):
+        # The M128 kernel launches a 2-CTA cluster per KV split. The generic
+        # policy divides by two to fit one physical CTA wave; Kimi's ragged
+        # decode traffic benefits from two waves that parallelize its long tail.
+        split_kv = min(max(1, max_active_blocks // B // q_len), 32)
+        workspace_size = (
+            BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
+                H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+            )
+        )
     else:
         split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
             B, q_len, max_active_blocks
