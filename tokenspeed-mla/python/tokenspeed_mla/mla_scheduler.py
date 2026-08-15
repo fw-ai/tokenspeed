@@ -173,6 +173,16 @@ def plan_ragged_schedule(
         raise ValueError(f"kv_tile_size must be positive, got {kv_tile_size}")
 
     batch_size = seq_lens.numel()
+    if target_work_items < batch_size:
+        raise ValueError(
+            "target_work_items must provide at least one slot per request, got "
+            f"{target_work_items} for batch_size={batch_size}"
+        )
+    if base_work_items < batch_size:
+        raise ValueError(
+            "base_work_items must be at least batch_size because every request "
+            f"requires one split, got {base_work_items} for batch_size={batch_size}"
+        )
     if batch_size == 0:
         empty = torch.empty_like(seq_lens)
         return (
@@ -304,6 +314,16 @@ def plan_ragged_schedule_and_sanitize_block_tables(
         raise ValueError(f"kv_tile_size must be positive, got {kv_tile_size}")
 
     batch_size = seq_lens.numel()
+    if target_work_items < batch_size:
+        raise ValueError(
+            "target_work_items must provide at least one slot per request, got "
+            f"{target_work_items} for batch_size={batch_size}"
+        )
+    if base_work_items < batch_size:
+        raise ValueError(
+            "base_work_items must be at least batch_size because every request "
+            f"requires one split, got {base_work_items} for batch_size={batch_size}"
+        )
     block_size = triton.next_power_of_2(batch_size)
     if block_size > 1024:
         raise ValueError(

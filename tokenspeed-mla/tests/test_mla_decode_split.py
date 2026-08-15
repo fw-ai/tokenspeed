@@ -61,6 +61,41 @@ class MLADecodeSplitTest(unittest.TestCase):
         self.assertEqual(split_counts.cpu().tolist(), [1, 3])
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_ragged_split_planner_rejects_too_small_work_budgets(self) -> None:
+        seq_lens = torch.full(
+            (4,),
+            128,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        block_tables = torch.arange(
+            4,
+            dtype=torch.int32,
+            device="cuda",
+        ).reshape(4, 1)
+
+        with self.assertRaisesRegex(ValueError, "target_work_items.*batch_size"):
+            plan_ragged_schedule(
+                seq_lens,
+                target_work_items=3,
+                max_splits=4,
+            )
+        with self.assertRaisesRegex(ValueError, "base_work_items.*batch_size"):
+            plan_ragged_schedule(
+                seq_lens,
+                base_work_items=3,
+                target_work_items=8,
+                max_splits=4,
+            )
+        with self.assertRaisesRegex(ValueError, "target_work_items.*batch_size"):
+            plan_ragged_schedule_and_sanitize_block_tables(
+                seq_lens,
+                block_tables,
+                target_work_items=3,
+                max_splits=4,
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_ragged_split_planner_materializes_compact_worklist(self) -> None:
         seq_lens = torch.tensor(
             [128, 128, 128, 640],
