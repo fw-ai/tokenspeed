@@ -23,6 +23,7 @@
 try:
     from tokenspeed_mla.fmha_binary import has_binary_prefill
     from tokenspeed_mla.mla_decode import (
+        prepare_mla_decode_ragged_metadata,
         tokenspeed_mla_decode,
     )
     from tokenspeed_mla.mla_kv_pack_quantize_fp8 import (
@@ -43,6 +44,7 @@ except ImportError as exc:
         ) from _IMPORT_ERROR
 
     tokenspeed_mla_decode = _unavailable
+    prepare_mla_decode_ragged_metadata = _unavailable
     tokenspeed_mla_prefill = _unavailable
     mla_kv_pack_quantize_fp8 = _unavailable
     get_num_sm = _unavailable
@@ -51,6 +53,7 @@ except ImportError as exc:
 
 __all__ = [
     "tokenspeed_mla_decode",
+    "prepare_mla_decode_ragged_metadata",
     "tokenspeed_mla_prefill",
     "mla_kv_pack_quantize_fp8",
     "get_num_sm",
