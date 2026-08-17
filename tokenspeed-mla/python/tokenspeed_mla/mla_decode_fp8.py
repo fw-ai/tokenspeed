@@ -408,9 +408,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         lse: Optional[cute.Tensor],
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
+        workspace_split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
         causal_seqs: Optional[cute.Tensor],  # per-request global causal bound (DCP)
         block_split_kvs: Optional[cute.Tensor],
+        scheduler_offsets: Optional[cute.Tensor],
+        scheduler_worklist: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: cuda.CUstream,
@@ -444,10 +447,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type workspace: cute.Tensor
         :param split_kv: The scalar factor for split KV
         :type split_kv: cutlass.Int32
+        :param workspace_split_kv: Maximum per-request split count available to
+            the ragged planner. The compact workspace itself uses the fixed
+            ``batch_size * split_kv`` work budget.
+        :type workspace_split_kv: cutlass.Int32
         :param cache_seqs: The cache sequences tensor with shape [batch_size]
         :type cache_seqs: cute.Tensor
         :param block_split_kvs: The block split KV tensor with shape [batch_size]
         :type block_split_kvs: cute.Tensor
+        :param scheduler_offsets: Exclusive prefix offsets for each request's
+            compact workspace range.
+        :type scheduler_offsets: cute.Tensor
+        :param scheduler_worklist: Compact ``[work_items, 2]`` tensor containing
+            request and local-split indices for O(1) scheduler lookup.
+        :type scheduler_worklist: cute.Tensor
         :param softmax_scale: The scale factor for softmax
         :type softmax_scale: cutlass.Float32
         :param output_scale: The scale factor for the output
@@ -571,12 +584,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ),
                 )
 
+        workspace_splits = workspace_split_kv
+        workspace_batches = q_latent.shape[3]
+        if cutlass.const_expr(
+            self.is_persistent
+            and self.is_var_split_kv
+            and self.seq_len_q == 1
+        ):
+            workspace_splits = split_kv * workspace_batches
+            workspace_batches = 1
         acc_o, acc_lse = self.initialize_workspace(
             q_latent.shape[0],
             q_latent.shape[1],
             q_latent.shape[2],
-            q_latent.shape[3],
-            split_kv,
+            workspace_batches,
+            workspace_splits,
             self.acc_dtype,
             workspace,
         )
@@ -958,6 +980,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cache_seqs,
             causal_seqs,
             block_split_kvs,
+            scheduler_worklist,
             softmax_scale_log2,
             output_scale,
             q_latent_smem_layout_staged,
@@ -990,6 +1013,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 split_kv,
                 cache_seqs,
                 block_split_kvs,
+                scheduler_offsets,
             ).launch(
                 grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
                 block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
@@ -1066,6 +1090,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cache_seqs: cute.Tensor,
         causal_seqs: cute.Tensor,  # per-request global causal bound (DCP)
         block_split_kvs: cute.Tensor,
+        scheduler_worklist: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         q_latent_smem_layout_staged: cute.ComposedLayout,
@@ -1305,6 +1330,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
+                blk_coord = self.remap_compact_work_tile(
+                    scheduler_worklist, block_split_kvs, blk_coord
+                )
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
                     split_kv,
                     cache_seqs,
@@ -1363,6 +1391,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
+                blk_coord = self.remap_compact_work_tile(
+                    scheduler_worklist, block_split_kvs, blk_coord
+                )
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
                     split_kv,
                     cache_seqs,
@@ -1458,6 +1489,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
+                blk_coord = self.remap_compact_work_tile(
+                    scheduler_worklist, block_split_kvs, blk_coord
+                )
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
                     split_kv, cache_seqs, block_split_kvs, blk_coord
                 )
@@ -1552,12 +1586,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
+                workspace_split_idx, workspace_batch_idx = (
+                    self.get_workspace_coord(block_split_kvs, blk_coord)
+                )
+                blk_coord = self.remap_compact_work_tile(
+                    scheduler_worklist, block_split_kvs, blk_coord
+                )
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
                     split_kv, cache_seqs, block_split_kvs, blk_coord
                 )
                 if k_tile_count > 0:
                     compute_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
+                        workspace_split_idx=workspace_split_idx,
+                        workspace_batch_idx=workspace_batch_idx,
                         split_kv=split_kv,
                         local_split_kv=local_split_kv,
                         smem_exchange=softmax_smem_exchange,
@@ -1621,12 +1663,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
+                workspace_split_idx, workspace_batch_idx = (
+                    self.get_workspace_coord(block_split_kvs, blk_coord)
+                )
+                blk_coord = self.remap_compact_work_tile(
+                    scheduler_worklist, block_split_kvs, blk_coord
+                )
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
                     split_kv, cache_seqs, block_split_kvs, blk_coord
                 )
                 if k_tile_count > 0:
                     compute_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
+                        workspace_split_idx=workspace_split_idx,
+                        workspace_batch_idx=workspace_batch_idx,
                         split_kv=split_kv,
                         local_split_kv=local_split_kv,
                         smem_exchange=epilogue_smem_exchange,
@@ -1672,6 +1722,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
+        scheduler_offsets: cute.Tensor,
     ):
         """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
         from multiple split_kv blocks into final outputs.
@@ -1690,6 +1741,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type cache_seqs: cute.Tensor
         :param block_split_kvs: Per-block split_kv values tensor (for variable split_kv)
         :type block_split_kvs: cute.Tensor
+        :param scheduler_offsets: Exclusive request offsets in compact workspace
+        :type scheduler_offsets: cute.Tensor
         """
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -1697,6 +1750,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         local_split_kv = (
             block_split_kvs[blk_coord[2]] if self.is_var_split_kv else split_kv
         )
+        workspace_split_offset = cutlass.Int32(0)
+        workspace_batch_idx = blk_coord[2]
+        if cutlass.const_expr(
+            self.is_persistent
+            and self.is_var_split_kv
+            and self.seq_len_q == 1
+        ):
+            workspace_split_offset = scheduler_offsets[blk_coord[2]]
+            workspace_batch_idx = cutlass.Int32(0)
         k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]], self.mma_qk_tiler[1])
         k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
         local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
@@ -1709,12 +1771,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         cute.arch.griddepcontrol_wait()
 
-        gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
+        gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], workspace_batch_idx]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             # calculate the global lse and exp ^ (local_lse - global_lse)
             lse_per_thread = cute.ceil_div(MAX_SPLITS, self.threads_per_warp)
-
             local_lse = cute.make_rmem_tensor(
                 cute.make_layout(lse_per_thread), self.lse_dtype
             )
@@ -1723,7 +1784,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
                 local_lse[i] = (
-                    gLSE[split_kv_idx]
+                    gLSE[workspace_split_offset + split_kv_idx]
                     if cute.elem_less(split_kv_idx, local_split_kv)
                     else -self.lse_dtype.inf
                 )
@@ -1759,7 +1820,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         elements_per_thread = cute.ceil_div(
             self.latent_dim, self.threads_per_warp * self.num_compute_warps
         )
-        gAccO = mAccO[blk_coord[0], None, None, blk_coord[1], blk_coord[2]]
+        gAccO = mAccO[blk_coord[0], None, None, blk_coord[1], workspace_batch_idx]
         rAccO = cute.make_rmem_tensor(
             cute.make_layout(elements_per_thread), self.acc_dtype
         )
@@ -1768,7 +1829,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         for i in range(local_split_kv):
             for j in cutlass.range_constexpr(elements_per_thread):
                 element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
-                rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+                rAccO[j] += (
+                    gAccO[workspace_split_offset + i, element_idx]
+                    * smem_lse_scale[i]
+                )
         rO.store(rAccO.load().to(self.o_dtype))
         for j in cutlass.range_constexpr(elements_per_thread):
             element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
@@ -1815,6 +1879,59 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
         max_split_kv = 32
         return min(blocks_per_batch, max_split_kv)
+
+    @cute.jit
+    def get_workspace_coord(
+        self,
+        block_split_kvs: cute.Tensor,
+        blk_coord: cute.Coord,
+    ) -> tuple[cutlass.Int32, cutlass.Int32]:
+        """Map a scheduled tile to its compact split-workspace coordinates."""
+        if cutlass.const_expr(
+            self.is_persistent
+            and self.is_var_split_kv
+            and self.seq_len_q == 1
+        ):
+            return (
+                blk_coord[3] * block_split_kvs.shape[0] + blk_coord[2],
+                cutlass.Int32(0),
+            )
+        return blk_coord[3], blk_coord[2]
+
+    @cute.jit
+    def remap_compact_work_tile(
+        self,
+        scheduler_worklist: cute.Tensor,
+        block_split_kvs: cute.Tensor,
+        blk_coord: cute.Coord,
+    ) -> cute.Coord:
+        """Map the rectangular scheduler coordinate onto compact ragged work.
+
+        Persistent variable-split decode uses the existing fixed launch extent,
+        but interprets its leading logical slots as the concatenation of each
+        request's useful splits. Slots beyond that concatenation map to an
+        intentionally empty split and are skipped by ``get_k_tile_count``.
+        """
+        if cutlass.const_expr(
+            self.is_persistent
+            and self.is_var_split_kv
+            and self.seq_len_q == 1
+        ):
+            batch_size = block_split_kvs.shape[0]
+            work_idx = blk_coord[3] * batch_size + blk_coord[2]
+            batch_idx = scheduler_worklist[work_idx, 0]
+            local_split_idx = scheduler_worklist[work_idx, 1]
+            if batch_idx < 0:
+                batch_idx = cutlass.Int32(0)
+                local_split_idx = block_split_kvs[0]
+
+            blk_coord = (
+                blk_coord[0],
+                blk_coord[1],
+                batch_idx,
+                local_split_idx,
+            )
+        return blk_coord
 
     @cute.jit
     def get_k_tile_count(
@@ -3502,19 +3619,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         gO = None
         if cutlass.const_expr(common_params.mAccO is not None):
             gO = cute.local_tile(
-                common_params.mAccO[None, common_params.blk_coord[3], None, None, None],
+                common_params.mAccO[
+                    None, common_params.workspace_split_idx, None, None, None
+                ],
                 cta_pv_tiler_mn,
                 (
                     common_params.blk_coord[0],
                     iter_n,
                     common_params.blk_coord[1],
-                    common_params.blk_coord[2],
+                    common_params.workspace_batch_idx,
                 ),
             )
             cO = cute.local_tile(
                 cute.make_identity_tensor(
                     common_params.mAccO[
-                        None, common_params.blk_coord[3], None, None, None
+                        None, common_params.workspace_split_idx, None, None, None
                     ].shape
                 ),
                 cta_pv_tiler_mn,
@@ -3522,7 +3641,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     common_params.blk_coord[0],
                     iter_n,
                     common_params.blk_coord[1],
-                    common_params.blk_coord[2],
+                    common_params.workspace_batch_idx,
                 ),
             )
         else:
@@ -3810,7 +3929,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
             # Full TMEM load to registers
             cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
-
             if cutlass.const_expr(self.use_m64_ws):
                 num_epi_subtiles = cute.size(tTR_rAcc, mode=[2])
                 vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
@@ -3870,7 +3988,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             tR2G_rO_dst[None, None, d_sub],
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
-
             # store the lse to global memory
             cta_pv_tiler = (
                 self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
@@ -3916,27 +4033,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 )
                 gLSE = cute.local_tile(
                     epilogue_params.mAccLSE[
-                        None, common_params.blk_coord[3], None, None
+                        None, common_params.workspace_split_idx, None, None
                     ],
                     (cta_pv_tiler[0], 1, 1),
                     (
                         common_params.blk_coord[0],
                         common_params.blk_coord[1],
-                        common_params.blk_coord[2],
+                        common_params.workspace_batch_idx,
                     ),
                     (1, 1, 1),
                 )
                 cLSE = cute.local_tile(
                     cute.make_identity_tensor(
                         epilogue_params.mAccLSE[
-                            None, common_params.blk_coord[3], None, None
+                            None, common_params.workspace_split_idx, None, None
                         ].shape
                     ),
                     (cta_pv_tiler[0], 1, 1),
                     (
                         common_params.blk_coord[0],
                         common_params.blk_coord[1],
-                        common_params.blk_coord[2],
+                        common_params.workspace_batch_idx,
                     ),
                     (1, 1, 1),
                 )
@@ -3946,7 +4063,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 elif cutlass.const_expr(self.warps_in_n == 2):
                     if cute.elem_less(cLSE[tidx][0], common_params.H):
                         gLSE[tidx] = lse
-
             cute.arch.fence_view_async_tmem_load()
             common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
             mma_o_consumer_state.advance()
@@ -4648,6 +4764,37 @@ def run(
             )
         return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
 
+    def create_scheduler_metadata(batch_size, split_kv, block_split_kvs_ref):
+        if block_split_kvs_ref is None:
+            return None, None, None, None
+
+        scheduler_offsets_ref = torch.zeros(batch_size + 1, dtype=torch.int32)
+        scheduler_offsets_ref[1:] = torch.cumsum(block_split_kvs_ref, dim=0)
+        scheduler_worklist_ref = torch.full(
+            (batch_size * split_kv, 2), -1, dtype=torch.int32
+        )
+        work_idx = 0
+        for batch_idx in range(batch_size):
+            for local_split_idx in range(int(block_split_kvs_ref[batch_idx])):
+                scheduler_worklist_ref[work_idx, 0] = batch_idx
+                scheduler_worklist_ref[work_idx, 1] = local_split_idx
+                work_idx += 1
+
+        scheduler_offsets_gpu = scheduler_offsets_ref.cuda()
+        scheduler_worklist_gpu = scheduler_worklist_ref.cuda()
+        scheduler_offsets = from_dlpack(
+            scheduler_offsets_gpu, assumed_align=16
+        ).mark_layout_dynamic()
+        scheduler_worklist = from_dlpack(
+            scheduler_worklist_gpu, assumed_align=16
+        ).mark_layout_dynamic(leading_dim=1)
+        return (
+            scheduler_offsets,
+            scheduler_worklist,
+            scheduler_offsets_gpu,
+            scheduler_worklist_gpu,
+        )
+
     def create_workspace(
         num_heads, seq_len_q, latent_dim, batch_size, split_kv, acc_dtype
     ):
@@ -4694,6 +4841,12 @@ def run(
             max_active_clusters,
         )
     )
+    (
+        scheduler_offsets,
+        scheduler_worklist,
+        scheduler_offsets_torch,
+        scheduler_worklist_torch,
+    ) = create_scheduler_metadata(batch_size, split_kv, block_split_kvs_ref)
 
     q_latent_ref, q_latent, q_latent_torch = create_data_tensor(
         batch_size,
@@ -4788,9 +4941,12 @@ def run(
         lse,
         workspace,
         split_kv,
+        split_kv,
         cache_seqs,
         cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
         block_split_kvs,
+        scheduler_offsets,
+        scheduler_worklist,
         softmax_scale,
         output_scale,
         stream,
@@ -4902,9 +5058,12 @@ def run(
             lse,
             workspace,
             split_kv,
+            split_kv,
             cache_seqs,
             cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
             block_split_kvs,
+            scheduler_offsets,
+            scheduler_worklist,
             softmax_scale,
             output_scale,
             stream,
@@ -4964,7 +5123,7 @@ def run(
         _, page_table, _ = create_page_table(
             batch_size, seq_len_k, is_var_seq, page_size
         )
-        _split_kv, _, block_split_kvs, _ = create_block_split_kvs(
+        _split_kv, _block_split_kvs_ref, block_split_kvs, _ = create_block_split_kvs(
             batch_size,
             split_kv,
             cache_seqs_ref,
@@ -4972,6 +5131,9 @@ def run(
             mma_qk_tiler_mn,
             cluster_shape_mnk,
             max_active_clusters,
+        )
+        scheduler_offsets, scheduler_worklist, _, _ = create_scheduler_metadata(
+            batch_size, _split_kv, _block_split_kvs_ref
         )
 
         _, q_latent, _ = create_data_tensor(
@@ -5039,9 +5201,12 @@ def run(
             lse,
             workspace,
             _split_kv,
+            _split_kv,
             cache_seqs,
             cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
             block_split_kvs,
+            scheduler_offsets,
+            scheduler_worklist,
             softmax_scale,
             output_scale,
             stream,
@@ -5064,6 +5229,12 @@ def run(
         if is_var_split_kv:
             one_workspace_bytes += (
                 block_split_kvs_torch.numel() * block_split_kvs_torch.element_size()
+            )
+            one_workspace_bytes += (
+                scheduler_offsets_torch.numel()
+                * scheduler_offsets_torch.element_size()
+                + scheduler_worklist_torch.numel()
+                * scheduler_worklist_torch.element_size()
             )
         if workspace_torch is not None:
             one_workspace_bytes += (

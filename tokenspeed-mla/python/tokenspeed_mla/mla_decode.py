@@ -43,11 +43,21 @@ from tokenspeed_mla.mla_helpers import (
     get_mla_decode_fold_sq_factor,
     select_mla_decode_tilers,
 )
+from tokenspeed_mla.mla_scheduler import (
+    plan_ragged_schedule,
+    plan_ragged_schedule_and_sanitize_block_tables,
+)
 from tokenspeed_mla.utils import (
     get_max_active_clusters,
     get_num_sm,
     torch_to_cutlass_dtype,
 )
+
+RaggedScheduleMetadata = Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
 
 
 @functools.cache
@@ -104,6 +114,64 @@ def _get_split_kv_and_workspace_size(
             )
         )
     return split_kv, workspace_size
+
+
+def prepare_mla_decode_ragged_metadata(
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    *,
+    max_seq_len: int,
+    num_heads: int = 96,
+    kv_lora_rank: int = 512,
+) -> tuple[torch.Tensor, RaggedScheduleMetadata]:
+    """Fuse serving block-table sanitization with K3 ragged planning.
+
+    The returned block table replaces ``torch.where(block_tables == -1, 0,
+    block_tables)``. Passing the returned metadata to
+    :func:`tokenspeed_mla_decode` suppresses its standalone planner launch.
+    """
+    batch_size = seq_lens.numel()
+    if batch_size <= 0:
+        raise ValueError("ragged MLA decode requires a non-empty batch")
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
+    if num_heads != 96 or kv_lora_rank != 512:
+        raise ValueError(
+            "ragged metadata preparation currently requires Kimi K3 "
+            f"(num_heads=96, kv_lora_rank=512), got {num_heads=} and "
+            f"{kv_lora_rank=}"
+        )
+
+    compute_capability = torch.cuda.get_device_capability(seq_lens.device)
+    mma_qk_tiler_mn, _ = select_mla_decode_tilers(
+        num_heads,
+        1,
+        is_fp8=True,
+        compute_capability=compute_capability,
+    )
+    if mma_qk_tiler_mn[0] != 128:
+        raise ValueError(
+            "ragged metadata preparation requires the K3 M128 decode tiler, "
+            f"got {mma_qk_tiler_mn}"
+        )
+    split_kv, _ = _get_split_kv_and_workspace_size(
+        batch_size,
+        1,
+        num_heads,
+        kv_lora_rank,
+        get_num_sm(seq_lens.device),
+        max_seq_len,
+        torch.float8_e4m3fn,
+        mma_qk_tiler_mn,
+    )
+    return plan_ragged_schedule_and_sanitize_block_tables(
+        seq_lens,
+        block_tables,
+        target_work_items=batch_size * split_kv,
+        base_work_items=batch_size * max(1, split_kv // 2),
+        max_splits=32,
+        kv_tile_size=mma_qk_tiler_mn[1],
+    )
 
 
 @functools.cache
@@ -241,6 +309,8 @@ def _get_compiled_mla_kernel(
     sym_seq_kv = cute.sym_int()
     sym_page_count = cute.sym_int()
     sym_workspace_size = cute.sym_int()
+    sym_work_items = cute.sym_int()
+    sym_scheduler_offsets = cute.sym_int()
 
     # q_latent, q_rope, c_latent, c_rope are slices of contiguous tensors on
     # the last dim (e.g. query[..., :kv_lora_rank]), so they are NOT contiguous:
@@ -323,6 +393,21 @@ def _get_compiled_mla_kernel(
         )
     else:
         block_split_kvs_fake = None
+    if is_fp8 and is_var_split_kv:
+        scheduler_offsets_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_scheduler_offsets,),
+            assumed_align=4,
+        )
+        scheduler_worklist_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_work_items, 2),
+            stride_order=(1, 0),
+            assumed_align=4,
+        )
+    else:
+        scheduler_offsets_fake = None
+        scheduler_worklist_fake = None
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -349,13 +434,18 @@ def _get_compiled_mla_kernel(
         lse_fake,
         workspace_fake,
         Int32(1),  # split_kv placeholder
-        cache_seqs_fake,
     ]
+    if is_fp8:
+        compile_args.append(Int32(1))  # workspace_split_kv placeholder
+    compile_args.append(cache_seqs_fake)
     # DCP causal bound is an fp8-decode-kernel-only argument (see the call site).
     if is_fp8:
         compile_args.append(causal_seqs_fake)
+    compile_args.append(block_split_kvs_fake)
+    if is_fp8:
+        compile_args.append(scheduler_offsets_fake)
+        compile_args.append(scheduler_worklist_fake)
     compile_args += [
-        block_split_kvs_fake,
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
         stream_fake,
@@ -389,6 +479,8 @@ def tokenspeed_mla_decode(
     ] = None,  # per-request global causal bound; None = local (non-DCP)
     cp_world: int = 1,  # decode-context-parallel world size (1 = no DCP)
     cp_rank: int = 0,  # this rank's index in [0, cp_world); subtracted from causal_seqs
+    use_ragged_scheduler: bool = False,
+    ragged_scheduler_metadata: Optional[RaggedScheduleMetadata] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -457,6 +549,15 @@ def tokenspeed_mla_decode(
         bound is ``ceil((causal_seqs - cp_rank) / cp_world)``; the wrapper folds
         ``cp_rank`` in for you, so callers pass the same global ``causal_seqs`` on
         every rank. Must be 0 when ``cp_world == 1``.
+    use_ragged_scheduler : bool
+        Experimental Kimi K3 decode scheduler. Builds FlashMLA-style
+        per-request split counts on the GPU, compacts the useful work onto a
+        fixed persistent grid, and keeps the launch extent CUDA-graph stable.
+        The default is False and leaves the existing scheduler unchanged.
+    ragged_scheduler_metadata : tuple[torch.Tensor, torch.Tensor, torch.Tensor], optional
+        Precomputed ``(split_counts, split_offsets, worklist)``. Supplying
+        metadata prepared by :func:`prepare_mla_decode_ragged_metadata` skips
+        the standalone planner launch.
 
     Returns
     -------
@@ -526,6 +627,34 @@ def tokenspeed_mla_decode(
         q_dtype,
         mma_qk_tiler_mn,
     )
+    workspace_split_kv = split_kv
+    if ragged_scheduler_metadata is not None and not use_ragged_scheduler:
+        raise ValueError(
+            "ragged_scheduler_metadata requires use_ragged_scheduler=True"
+        )
+    if use_ragged_scheduler:
+        if not (
+            is_var_seq
+            and is_fp8
+            and mma_qk_tiler_mn[0] == 128
+            and H == 96
+            and q_len == 1
+        ):
+            raise ValueError(
+                "use_ragged_scheduler currently requires variable-length Kimi "
+                "K3 FP8 decode (H=96, q_len=1, M128)"
+            )
+        # The compact workspace has one slot per launched work item, independent
+        # of the largest per-request split count.
+        workspace_split_kv = 32
+        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
+            H_eff,
+            q_len_eff,
+            kv_lora_rank,
+            1,
+            B * split_kv,
+            cutlass.Float32,
+        )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert (
@@ -598,12 +727,57 @@ def tokenspeed_mla_decode(
         if cp_rank:
             causal_seqs_dev = causal_seqs_dev - cp_rank
 
-    is_var_split_kv = False
-    block_split_kvs = None
+    if use_ragged_scheduler:
+        if ragged_scheduler_metadata is None:
+            block_split_kvs, scheduler_offsets, scheduler_worklist = (
+                plan_ragged_schedule(
+                    cache_seqs,
+                    target_work_items=B * split_kv,
+                    base_work_items=B * max(1, split_kv // 2),
+                    max_splits=workspace_split_kv,
+                    kv_tile_size=mma_qk_tiler_mn[1],
+                )
+            )
+        else:
+            (
+                block_split_kvs,
+                scheduler_offsets,
+                scheduler_worklist,
+            ) = ragged_scheduler_metadata
+            expected_work_items = B * split_kv
+            if (
+                block_split_kvs.shape != (B,)
+                or scheduler_offsets.shape != (B + 1,)
+                or scheduler_worklist.shape != (expected_work_items, 2)
+            ):
+                raise ValueError(
+                    "invalid ragged scheduler metadata shapes: expected "
+                    f"({B},), ({B + 1},), ({expected_work_items}, 2), got "
+                    f"{tuple(block_split_kvs.shape)}, "
+                    f"{tuple(scheduler_offsets.shape)}, and "
+                    f"{tuple(scheduler_worklist.shape)}"
+                )
+            for name, tensor in (
+                ("split counts", block_split_kvs),
+                ("split offsets", scheduler_offsets),
+                ("worklist", scheduler_worklist),
+            ):
+                if tensor.dtype != torch.int32 or tensor.device != query.device:
+                    raise ValueError(
+                        f"ragged scheduler {name} must be int32 on "
+                        f"{query.device}, got {tensor.dtype} on {tensor.device}"
+                    )
+        is_var_split_kv = True
+    else:
+        block_split_kvs = None
+        scheduler_offsets = None
+        scheduler_worklist = None
+        is_var_split_kv = False
     skip_correction_threshold = 0.0
 
-    # For fixed-length input, set is_persistent to True; otherwise, set to False.
-    is_persistent = not is_var_seq
+    # Ragged scheduling needs a fixed worker grid; the default path remains
+    # persistent only for fixed-length input.
+    is_persistent = use_ragged_scheduler or not is_var_seq
 
     # Validate configuration (cached, negligible overhead after first call)
     _check_can_implement(
@@ -671,14 +845,19 @@ def tokenspeed_mla_decode(
         lse_real,
         workspace_bytes,
         Int32(split_kv),
-        cache_seqs,
     ]
+    if is_fp8:
+        call_args.append(Int32(workspace_split_kv))
+    call_args.append(cache_seqs)
     # DCP: the per-request global causal bound is an fp8-decode-kernel-only
     # argument; the fp16 kernel masks against the local cache length.
     if is_fp8:
         call_args.append(causal_seqs_dev)
+    call_args.append(block_split_kvs)
+    if is_fp8:
+        call_args.append(scheduler_offsets)
+        call_args.append(scheduler_worklist)
     call_args += [
-        block_split_kvs,
         Float32(softmax_scale),
         Float32(output_scale),
     ]

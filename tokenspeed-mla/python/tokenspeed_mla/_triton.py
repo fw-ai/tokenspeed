@@ -20,12 +20,24 @@
 
 """Triton vendor-package indirection used by the standalone MLA package."""
 
-import tokenspeed_triton as triton
-from tokenspeed_triton import language as tl
-
 try:
-    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
-except ImportError:
-    TensorDescriptor = None
+    import tokenspeed_triton as triton
+    from tokenspeed_triton import language as tl
+
+    try:
+        from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
+    except ImportError:
+        TensorDescriptor = None
+except ModuleNotFoundError as exc:
+    if exc.name != "tokenspeed_triton":
+        raise
+
+    import triton
+    from triton import language as tl
+
+    try:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+    except ImportError:
+        TensorDescriptor = None
 
 __all__ = ["TensorDescriptor", "tl", "triton"]
