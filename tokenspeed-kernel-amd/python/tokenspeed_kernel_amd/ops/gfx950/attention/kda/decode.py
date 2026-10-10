@@ -256,7 +256,7 @@ def gluon_kda_paged_decode_gfx950(
     )
     write_offsets = value_offsets[:, None] * K + key_offsets[None, :]
     cdna4.buffer_store(
-        running,
+        running.to(state_pool.dtype.element_ty),
         state_pool + write_base,
         write_offsets.to(gl.int32),
         mask=valid_write & state_mask,

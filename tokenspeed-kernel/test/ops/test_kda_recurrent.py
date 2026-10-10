@@ -985,6 +985,7 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
 
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
 @pytest.mark.parametrize("strided_inputs", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     ("heads", "key_dim", "value_dim"),
     [(2, 8, 8), (2, 8, 5), (12, 128, 128)],
@@ -995,6 +996,7 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     heads: int,
     key_dim: int,
     value_dim: int,
+    state_dtype: torch.dtype,
 ) -> None:
     """AMD single-token dispatch must select Gluon and preserve native math."""
     platform = current_platform()
@@ -1046,7 +1048,7 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
         value_dim,
         key_dim,
         device=device,
-        dtype=torch.float32,
+        dtype=state_dtype,
     )
     initial_pool = state_pool.clone()
     expected_pool = state_pool.clone()
@@ -1105,7 +1107,13 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     torch.testing.assert_close(
         actual_out.float(), expected_out.float(), atol=2e-2, rtol=2e-2
     )
-    torch.testing.assert_close(state_pool, expected_pool, atol=2e-5, rtol=2e-5)
+    state_tolerance = 2e-5 if state_dtype is torch.float32 else 3e-2
+    torch.testing.assert_close(
+        state_pool,
+        expected_pool,
+        atol=state_tolerance,
+        rtol=state_tolerance,
+    )
 
 
 def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
